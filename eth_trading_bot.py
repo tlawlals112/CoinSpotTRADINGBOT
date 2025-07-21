@@ -65,19 +65,28 @@ class ETHTradingBot:
             json.dump(self.trading_log, f, indent=2)
     
     def get_market_data(self):
-        """시장 데이터 수집"""
+        """시장 데이터 수집 + 15분봉 200MA 계산"""
         try:
-            # 1분봉 데이터 수집 (최근 100개)
+            # 1분봉 데이터 수집 (최근 1000개)
             ohlcv = self.exchange.fetch_ohlcv(
                 symbol=self.symbol,
                 timeframe='1m',
-                limit=100
+                limit=1000
             )
-            
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-            
+            # 15분봉 리샘플링 및 200MA 계산
+            df_15m = df.resample('15T').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            })
+            df_15m['ma_200'] = df_15m['close'].rolling(window=200).mean()
+            # 15분봉 200MA를 1분봉에 forward fill
+            df['ma_200_15m'] = df_15m['ma_200'].reindex(df.index, method='ffill')
             return df
         except Exception as e:
             print(f"❌ 시장 데이터 수집 오류: {e}")
@@ -121,34 +130,29 @@ class ETHTradingBot:
             return None
     
     def generate_signals(self, df):
-        """매매 신호 생성 (V2 전략 기반)"""
+        """매매 신호 생성 (V2+200MA 필터)"""
         try:
             df['signal'] = 0
-            
-            # 200MA 하락장 필터: 현재가가 200MA 아래면 매수 신호 생성 금지
-            ma_filter = df['close'] >= df['ma_200']
-            
-            # 매수 조건 (V2 전략) - 각 조건을 개별적으로 처리
+            # 1분봉 200MA, 15분봉 200MA 모두 위에 있을 때만 매수 신호 허용
+            ma_filter = (df['close'] >= df['ma_200']) & (df['close'] >= df['ma_200_15m'])
+            # 매수 조건 (V2 전략)
             buy_conditions = (
-                (df['rsi'] < 30) &  # RSI 과매도
-                (df['close'] < df['bb_lower']) &  # 볼린저 하단 터치
-                (df['macd'] > df['macd_signal']) &  # MACD 상승
-                (df['volume_ratio'] > 1.5) &  # 거래량 증가
-                (df['close'] > df['vwma_20'] * 0.98) &  # VWMA 근처
+                (df['rsi'] < 30) &
+                (df['close'] < df['bb_lower']) &
+                (df['macd'] > df['macd_signal']) &
+                (df['volume_ratio'] > 1.5) &
+                (df['close'] > df['vwma_20'] * 0.98) &
                 ma_filter
             )
-            
             # 매도 조건
             sell_conditions = (
-                (df['rsi'] > 70) &  # RSI 과매수
-                (df['close'] > df['bb_upper']) &  # 볼린저 상단 터치
-                (df['macd'] < df['macd_signal']) &  # MACD 하락
-                (df['volume_ratio'] > 1.2)  # 거래량 증가
+                (df['rsi'] > 70) &
+                (df['close'] > df['bb_upper']) &
+                (df['macd'] < df['macd_signal']) &
+                (df['volume_ratio'] > 1.2)
             )
-            
             df.loc[buy_conditions, 'signal'] = 1
             df.loc[sell_conditions, 'signal'] = -1
-            
             return df
         except Exception as e:
             print(f"❌ 신호 생성 오류: {e}")
@@ -293,26 +297,49 @@ class ETHTradingBot:
             return False
     
     def monitor_position(self):
-        """포지션 모니터링"""
+        """포지션 모니터링 (트레일링 스탑 포함)"""
         if not self.position or not self.entry_price:
             return
-        
         try:
-            # 현재가 조회
             ticker = self.exchange.fetch_ticker(self.symbol)
             current_price = ticker['last']
-            
-            # 수익률 계산
             pnl_pct = (current_price - self.entry_price) / self.entry_price
-            
-            # 손절/익절 확인
+            # 트레일링 스탑 파라미터
+            TRAILING_TRIGGER = 0.02  # 2% 이상 수익 발생 시 활성화
+            TRAILING_STEP = 0.01     # 1% 단위로 손절선 추적
+            # 트레일링 스탑 상태 저장
+            if not hasattr(self, 'trailing_active'):
+                self.trailing_active = False
+                self.trailing_stop = None
+            # 트레일링 스탑 활성화 조건
+            if not self.trailing_active and pnl_pct > TRAILING_TRIGGER:
+                self.trailing_active = True
+                self.trailing_stop = current_price * (1 - TRAILING_STEP)
+                print(f"🚨 트레일링 스탑 활성화! 손절선: {self.trailing_stop:.2f}")
+            # 트레일링 스탑 추적
+            if self.trailing_active:
+                new_trailing_stop = current_price * (1 - TRAILING_STEP)
+                if new_trailing_stop > self.trailing_stop:
+                    self.trailing_stop = new_trailing_stop
+                    print(f"🔄 트레일링 스탑 상향! 손절선: {self.trailing_stop:.2f}")
+                # 트레일링 스탑 손절 조건
+                if current_price <= self.trailing_stop:
+                    print(f"🔴 트레일링 스탑 발동! 수익률: {pnl_pct*100:.2f}%")
+                    self.market_sell('trailing_stop')
+                    self.trailing_active = False
+                    self.trailing_stop = None
+                    return
+            # 손절/익절
             if pnl_pct <= -self.stop_loss_pct:
                 print(f"📉 손절 조건 충족: {pnl_pct*100:.2f}%")
                 self.market_sell('stop_loss')
+                self.trailing_active = False
+                self.trailing_stop = None
             elif pnl_pct >= self.take_profit_pct:
                 print(f"📈 익절 조건 충족: {pnl_pct*100:.2f}%")
                 self.market_sell('take_profit')
-                
+                self.trailing_active = False
+                self.trailing_stop = None
         except Exception as e:
             print(f"❌ 포지션 모니터링 오류: {e}")
     
