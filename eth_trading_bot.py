@@ -112,6 +112,9 @@ class ETHTradingBot:
             df['volume_ma'] = df['volume'].rolling(window=20).mean()
             df['volume_ratio'] = df['volume'] / df['volume_ma']
             
+            # 200MA (하락장 필터용)
+            df['ma_200'] = df['close'].rolling(window=200).mean()
+            
             return df
         except Exception as e:
             print(f"❌ 지표 계산 오류: {e}")
@@ -122,13 +125,17 @@ class ETHTradingBot:
         try:
             df['signal'] = 0
             
+            # 200MA 하락장 필터: 현재가가 200MA 아래면 매수 신호 생성 금지
+            ma_filter = df['close'] >= df['ma_200']
+            
             # 매수 조건 (V2 전략) - 각 조건을 개별적으로 처리
             buy_conditions = (
                 (df['rsi'] < 30) &  # RSI 과매도
                 (df['close'] < df['bb_lower']) &  # 볼린저 하단 터치
                 (df['macd'] > df['macd_signal']) &  # MACD 상승
                 (df['volume_ratio'] > 1.5) &  # 거래량 증가
-                (df['close'] > df['vwma_20'] * 0.98)  # VWMA 근처
+                (df['close'] > df['vwma_20'] * 0.98) &  # VWMA 근처
+                ma_filter
             )
             
             # 매도 조건
@@ -231,7 +238,7 @@ class ETHTradingBot:
         try:
             # 현재 잔액 조회
             balance = self.exchange.fetch_balance()
-            eth_balance = balance['total']['ETH']
+            eth_balance = balance['total'].get('ETH', 0)
             
             if eth_balance <= 0:
                 print("❌ 매도할 이더리움이 없습니다.")
@@ -395,7 +402,7 @@ class ETHTradingBot:
                         ai_analysis = self.get_ai_analysis()
                         
                         # 매수 실행 (전체 잔액의 90% 사용)
-                        usdt_balance = balance['total']['USDT']
+                        usdt_balance = balance['total'].get('USDT', 0)
                         buy_amount = usdt_balance * 0.9
                         
                         if buy_amount > 10:  # 최소 $10
